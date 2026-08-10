@@ -33,20 +33,26 @@ export interface AppConfig {
 }
 
 export const APP_CONFIG_DEFAULTS: AppConfig = {
-  companyName: 'Murf AI',
-  pageTitle: 'Voice Agent Starter',
-  pageDescription: 'A voice agent powered by Murf Falcon — the fastest TTS API',
+  companyName: 'Kural',
+  pageTitle: 'Kural — Health Access Assistant',
+  pageDescription:
+    'Talk naturally with Kural for accessible, multilingual health guidance.',
 
-  supportsChatInput: true,
-  supportsVideoInput: true,
-  supportsScreenShare: true,
+  supportsChatInput: false,
+  supportsVideoInput: false,
+  supportsScreenShare: false,
   isPreConnectBufferEnabled: true,
 
   logo: '/murf-logo.svg',
-  accent: '#6366F1',
+  accent: '#0D9488',
   logoDark: '/murf-logo-dark.svg',
-  accentDark: '#818cf8',
-  startButtonText: 'Start talking',
+  accentDark: '#14B8A6',
+  startButtonText: 'Start Conversation',
+
+  audioVisualizerType: 'wave',
+  audioVisualizerColor: '#0D9488',
+  audioVisualizerColorDark: '#14B8A6',
+  audioVisualizerWaveLineWidth: 2,
 
   // optional: audio visualization configuration
   // audioVisualizerType: 'bar',
