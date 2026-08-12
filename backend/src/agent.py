@@ -3,6 +3,7 @@ import logging
 
 from dotenv import load_dotenv
 from livekit import rtc
+
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -16,6 +17,7 @@ from livekit.agents import (
     tokenize,
     room_io,
 )
+
 from livekit.plugins import (
     murf,
     silero,
@@ -23,6 +25,7 @@ from livekit.plugins import (
     deepgram,
     noise_cancellation,
 )
+
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from memory import (
@@ -30,6 +33,8 @@ from memory import (
     lookup_user as db_lookup_user,
     save_user_memory as db_save_user_memory,
 )
+
+from healthcare import find_healthcare_facilities
 
 
 logger = logging.getLogger("agent")
@@ -42,8 +47,8 @@ You are Kural, a friendly and responsible health access voice assistant.
 
 IDENTITY
 
-You help users with general health information and guide them toward appropriate
-professional care.
+You help users with general health information and guide them toward
+appropriate professional care.
 
 You are an AI assistant, not a doctor.
 
@@ -53,6 +58,7 @@ OBJECTIVES
 2. Provide safe, general health information.
 3. Help users understand when they should seek professional medical care.
 4. Escalate serious or urgent situations appropriately.
+5. Help users find nearby healthcare facilities when they ask for one.
 
 KNOWLEDGE
 
@@ -82,6 +88,8 @@ or any other language.
 
 Never romanize Tamil.
 
+When speaking Tamil, use Tamil script.
+
 STYLE
 
 Be warm, calm, empathetic, and concise.
@@ -103,8 +111,8 @@ If the caller is returning and saved memory exists, greet them by name
 and naturally use relevant saved information.
 
 For example:
-"Hi Shobamalika, welcome back. Last time we spoke about your health concern.
-How are you feeling today?"
+
+"Hi Shobamalika, welcome back. How are you feeling today?"
 
 Do not reveal the caller's internal user ID.
 
@@ -134,11 +142,61 @@ do not save anything.
 Never save written-out medical notes.
 
 For Health Access memory, only save concise structured facts such as:
+
 - age_band
 - ongoing_condition
 - last_triage_outcome
 
 Do not store unnecessary medical details.
+
+HEALTHCARE FACILITY LOOKUP
+
+Kural has a healthcare facility lookup tool called
+find_healthcare_facilities.
+
+Use this tool when the caller asks to find a nearby:
+
+- hospital
+- clinic
+- healthcare facility
+- doctor facility
+- PHC or similar healthcare facility
+
+The tool uses real OpenStreetMap data.
+
+If the caller asks for a nearby healthcare facility but has not provided
+a city, town, district, or locality, ask them for their location.
+
+Do not invent a healthcare facility.
+
+Do not claim that a facility is open, available, accepting patients,
+or currently providing a particular service unless the tool explicitly
+provides that information.
+
+The tool returns a retrieval timestamp.
+
+When useful, naturally mention that the facility information was retrieved
+from current OpenStreetMap data.
+
+Do not read raw JSON or technical tool output to the caller.
+
+Convert tool results into a natural spoken response.
+
+For example:
+
+"I found three healthcare facilities near Chennai. The closest one
+is ..."
+
+If the tool fails, tell the caller that the facility lookup is temporarily
+unavailable and that you cannot reliably provide a current result.
+
+Do not guess a facility when the tool fails.
+
+If the tool returns no facilities, explain that no matching facilities
+were found within the search area.
+
+The healthcare lookup is informational only. It does not replace
+professional medical advice.
 
 GUARDRAILS
 
@@ -188,6 +246,7 @@ saved information naturally.
 
 
 class Assistant(Agent):
+
     def __init__(self, user_id: str) -> None:
         super().__init__(
             instructions=SYSTEM_PROMPT,
@@ -196,7 +255,10 @@ class Assistant(Agent):
         self.user_id = user_id
 
     @function_tool
-    async def lookup_user(self, context: RunContext) -> str:
+    async def lookup_user(
+        self,
+        context: RunContext,
+    ) -> str:
         """
         Look up the current caller's saved memory.
 
@@ -284,7 +346,9 @@ class Assistant(Agent):
 
                 if not isinstance(parsed_facts, dict):
                     parsed_facts = {}
+
             except json.JSONDecodeError:
+
                 logger.warning(
                     "Invalid facts JSON received for user_id=%s",
                     self.user_id,
@@ -328,6 +392,69 @@ class Assistant(Agent):
             ensure_ascii=False,
         )
 
+    @function_tool
+    async def find_healthcare_facility(
+        self,
+        context: RunContext,
+        location: str,
+        facility_type: str = "any",
+    ) -> str:
+        """
+        Find nearby healthcare facilities using real OpenStreetMap data.
+
+        Use this when the caller asks for a nearby hospital, clinic,
+        PHC, doctor facility, or healthcare facility.
+
+        The caller must provide a city, town, district, or locality.
+
+        Args:
+            location:
+                The city, town, district, or locality where the caller
+                wants to find a healthcare facility.
+
+            facility_type:
+                "hospital" for hospitals,
+                "clinic" for clinics,
+                "any" for any healthcare facility.
+        """
+
+        logger.info(
+            "Healthcare facility lookup requested: "
+            "location=%s, facility_type=%s, user_id=%s",
+            location,
+            facility_type,
+            self.user_id,
+        )
+
+        try:
+            result = find_healthcare_facilities(
+                location=location,
+                facility_type=facility_type,
+                limit=3,
+            )
+
+        except Exception:
+            logger.exception(
+                "Unexpected healthcare lookup failure for location=%s",
+                location,
+            )
+
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        "The healthcare facility lookup failed unexpectedly. "
+                        "Do not invent a facility."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        return json.dumps(
+            result,
+            ensure_ascii=False,
+        )
+
 
 server = AgentServer()
 
@@ -344,6 +471,7 @@ server.setup_fnc = prewarm
 
 @server.rtc_session(agent_name="Kural")
 async def my_agent(ctx: JobContext):
+
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
@@ -363,9 +491,10 @@ async def my_agent(ctx: JobContext):
 
     # Set up the voice AI pipeline.
     session = AgentSession(
+
         stt=deepgram.STT(
             model="nova-3",
-            language="multi",
+            language="ta",
         ),
 
         llm=google.LLM(
@@ -373,7 +502,7 @@ async def my_agent(ctx: JobContext):
         ),
 
         tts=murf.TTS(
-            voice="Abhinav",
+            voice="Anisha",
             style="Conversation",
             tokenizer=tokenize.basic.SentenceTokenizer(
                 min_sentence_len=2

@@ -31,3 +31,10 @@ KMS
 
 # GitHub CLI
 .github/personal-instructions.md
+
+# Kural local memory database
+backend/data/data/
+
+# Kural local memory database
+data/
+kural_memory.db
