@@ -3,3 +3,7 @@
 !.env.example
 .DS_Store
 .pnpm-store/
+
+# Kural local memory database
+backend/data/
+backend/data/kural_memory.db

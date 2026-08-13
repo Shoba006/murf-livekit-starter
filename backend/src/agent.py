@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -13,7 +14,6 @@ from livekit.agents import (
     RunContext,
     cli,
     function_tool,
-    inference,
     tokenize,
     room_io,
 )
@@ -35,6 +35,16 @@ from memory import (
 )
 
 from healthcare import find_healthcare_facilities
+
+from escalation import (
+    initialize_escalation_database,
+    create_escalation as db_create_escalation,
+)
+
+from analytics import (
+    initialize_analytics_database,
+    record_call,
+)
 
 
 logger = logging.getLogger("agent")
@@ -58,7 +68,8 @@ OBJECTIVES
 2. Provide safe, general health information.
 3. Help users understand when they should seek professional medical care.
 4. Escalate serious or urgent situations appropriately.
-5. Help users find nearby healthcare facilities when they ask for one.
+5. Help users find nearby healthcare facilities.
+6. Know when a human healthcare professional should take over.
 
 KNOWLEDGE
 
@@ -110,10 +121,6 @@ to check whether this caller has been seen before.
 If the caller is returning and saved memory exists, greet them by name
 and naturally use relevant saved information.
 
-For example:
-
-"Hi Shobamalika, welcome back. How are you feeling today?"
-
 Do not reveal the caller's internal user ID.
 
 Do not invent memories.
@@ -127,10 +134,6 @@ This is a Health Access application.
 Before saving any new personal information, clearly tell the caller
 that Kural can remember this information for future conversations
 and ask whether they want Kural to remember it.
-
-Example:
-
-"I can remember that for our future conversations. Would you like me to save it?"
 
 Only call save_user_memory after the caller clearly agrees.
 
@@ -152,7 +155,7 @@ Do not store unnecessary medical details.
 HEALTHCARE FACILITY LOOKUP
 
 Kural has a healthcare facility lookup tool called
-find_healthcare_facilities.
+find_healthcare_facility.
 
 Use this tool when the caller asks to find a nearby:
 
@@ -160,7 +163,9 @@ Use this tool when the caller asks to find a nearby:
 - clinic
 - healthcare facility
 - doctor facility
-- PHC or similar healthcare facility
+- PHC
+- primary health centre
+- similar healthcare facility
 
 The tool uses real OpenStreetMap data.
 
@@ -173,19 +178,9 @@ Do not claim that a facility is open, available, accepting patients,
 or currently providing a particular service unless the tool explicitly
 provides that information.
 
-The tool returns a retrieval timestamp.
-
-When useful, naturally mention that the facility information was retrieved
-from current OpenStreetMap data.
-
 Do not read raw JSON or technical tool output to the caller.
 
 Convert tool results into a natural spoken response.
-
-For example:
-
-"I found three healthcare facilities near Chennai. The closest one
-is ..."
 
 If the tool fails, tell the caller that the facility lookup is temporarily
 unavailable and that you cannot reliably provide a current result.
@@ -195,8 +190,78 @@ Do not guess a facility when the tool fails.
 If the tool returns no facilities, explain that no matching facilities
 were found within the search area.
 
-The healthcare lookup is informational only. It does not replace
-professional medical advice.
+HUMAN HELP / ESCALATION
+
+Kural must ask for human help in these two situations:
+
+1. The caller describes a potentially serious or red-flag symptom.
+2. The caller asks Kural to diagnose a medical condition.
+
+For serious symptoms such as severe chest pain, difficulty breathing,
+loss of consciousness, severe bleeding, sudden weakness, or other
+potentially dangerous symptoms:
+
+- Do not diagnose the caller.
+- Tell them that the situation may require urgent professional attention.
+- Explain that Kural can create a human-help request.
+- Before sharing information with a human, ask for the caller's permission.
+- Only call create_escalation after the caller clearly gives permission.
+- If the caller refuses, do not create the request.
+- If the situation appears immediately life-threatening, strongly advise
+  seeking emergency medical care immediately.
+
+For diagnosis requests:
+
+- Explain that Kural cannot safely diagnose them.
+- Offer to create a human-help request so a qualified professional can
+  review the situation.
+- Ask for permission before sharing information.
+- Only create the request after explicit consent.
+
+When asking for escalation permission, clearly explain what will be shared.
+
+For example:
+
+"I can create a request for a healthcare professional. I would share a
+short summary of what you told me, what I checked, the urgency, and your
+preferred language. Would you like me to send that request?"
+
+Never send the full conversation.
+
+Never include passwords, OTPs, PINs, account numbers, or unnecessary
+private information.
+
+After create_escalation succeeds:
+
+- Give the caller the reference ID.
+- Tell the caller the request is open.
+- Explain that a human professional can review the request.
+- Do not promise an immediate response unless that is actually guaranteed.
+
+If escalation creation fails:
+
+- Tell the caller that the request could not be created.
+- Do not invent a reference ID.
+- Still advise them to seek appropriate professional care.
+
+ESCALATION TOOL
+
+The create_escalation tool creates a real local human-help request.
+
+Use it ONLY after the caller has explicitly consented.
+
+The tool should contain only a short useful summary.
+
+The summary should include:
+
+- what happened
+- what the caller needs
+- what Kural already checked
+- urgency
+- language
+- preferred follow-up method
+
+Do not include unnecessary medical details.
 
 GUARDRAILS
 
@@ -224,9 +289,9 @@ ESCALATION
 
 When a situation is outside your scope, say:
 
-"I'm sorry, but I can't safely diagnose or prescribe treatment. A qualified medical
-professional can assess your symptoms properly. If your symptoms are severe or
-getting worse, please seek urgent medical care."
+"I'm sorry, but I can't safely diagnose or prescribe treatment. A qualified
+medical professional can assess your symptoms properly. If your symptoms are
+severe or getting worse, please seek urgent medical care."
 
 OUT OF SCOPE
 
@@ -261,9 +326,6 @@ class Assistant(Agent):
     ) -> str:
         """
         Look up the current caller's saved memory.
-
-        Use this at the beginning of a conversation to determine whether
-        the caller has spoken with Kural before.
         """
 
         logger.info(
@@ -303,21 +365,7 @@ class Assistant(Agent):
         consent: bool = False,
     ) -> str:
         """
-        Save caller information after the caller has explicitly consented.
-
-        IMPORTANT:
-        This tool must only be used after the caller clearly agrees
-        to let Kural remember the information.
-
-        Never save information when the caller refuses or is uncertain.
-
-        Supported languages are only Tamil and English.
-
-        Args:
-            name: The caller's preferred name.
-            language_preference: Either "tamil" or "english".
-            facts: JSON object containing only concise structured health facts.
-            consent: Must be true only after explicit caller consent.
+        Save caller information after explicit consent.
         """
 
         if not consent:
@@ -348,7 +396,6 @@ class Assistant(Agent):
                     parsed_facts = {}
 
             except json.JSONDecodeError:
-
                 logger.warning(
                     "Invalid facts JSON received for user_id=%s",
                     self.user_id,
@@ -356,7 +403,6 @@ class Assistant(Agent):
 
                 return "Memory was not saved because the facts were invalid."
 
-        # Only allow the structured Health Access facts required by Day 4.
         allowed_fact_keys = {
             "age_band",
             "ongoing_condition",
@@ -401,21 +447,6 @@ class Assistant(Agent):
     ) -> str:
         """
         Find nearby healthcare facilities using real OpenStreetMap data.
-
-        Use this when the caller asks for a nearby hospital, clinic,
-        PHC, doctor facility, or healthcare facility.
-
-        The caller must provide a city, town, district, or locality.
-
-        Args:
-            location:
-                The city, town, district, or locality where the caller
-                wants to find a healthcare facility.
-
-            facility_type:
-                "hospital" for hospitals,
-                "clinic" for clinics,
-                "any" for any healthcare facility.
         """
 
         logger.info(
@@ -455,6 +486,115 @@ class Assistant(Agent):
             ensure_ascii=False,
         )
 
+    @function_tool
+    async def create_escalation(
+        self,
+        context: RunContext,
+        issue_type: str,
+        summary: str,
+        what_happened: str,
+        agent_checked: str = "",
+        urgency: str = "high",
+        language: str = "",
+        follow_up_method: str = "",
+        consent: bool = False,
+    ) -> str:
+        """
+        Create a human-help request after explicit caller consent.
+        """
+
+        if not consent:
+            logger.warning(
+                "Escalation blocked because caller did not consent. "
+                "user_id=%s",
+                self.user_id,
+            )
+
+            return json.dumps(
+                {
+                    "success": False,
+                    "message": (
+                        "The caller did not explicitly consent. "
+                        "No human-help request was created."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        if not issue_type.strip():
+            return json.dumps(
+                {
+                    "success": False,
+                    "message": "Issue type is required.",
+                },
+                ensure_ascii=False,
+            )
+
+        if not summary.strip():
+            return json.dumps(
+                {
+                    "success": False,
+                    "message": "A short summary is required.",
+                },
+                ensure_ascii=False,
+            )
+
+        if not what_happened.strip():
+            return json.dumps(
+                {
+                    "success": False,
+                    "message": "A description of what happened is required.",
+                },
+                ensure_ascii=False,
+            )
+
+        try:
+            result = db_create_escalation(
+                user_id=self.user_id,
+                issue_type=issue_type.strip(),
+                summary=summary.strip(),
+                what_happened=what_happened.strip(),
+                agent_checked=agent_checked.strip(),
+                urgency=urgency.strip().lower(),
+                language=language.strip(),
+                follow_up_method=follow_up_method.strip(),
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to create escalation for user_id=%s",
+                self.user_id,
+            )
+
+            return json.dumps(
+                {
+                    "success": False,
+                    "message": (
+                        "The human-help request could not be created. "
+                        "Do not invent a reference ID."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        logger.info(
+            "Created escalation reference_id=%s for user_id=%s",
+            result["reference_id"],
+            self.user_id,
+        )
+
+        return json.dumps(
+            {
+                "success": True,
+                "reference_id": result["reference_id"],
+                "status": result["status"],
+                "urgency": result["urgency"],
+                "created_at": result["created_at"],
+                "message": "Human-help request created successfully.",
+            },
+            ensure_ascii=False,
+        )
+
 
 server = AgentServer()
 
@@ -462,8 +602,9 @@ server = AgentServer()
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
-    # Create the SQLite database before the first call.
     initialize_database()
+    initialize_escalation_database()
+    initialize_analytics_database()
 
 
 server.setup_fnc = prewarm
@@ -476,31 +617,28 @@ async def my_agent(ctx: JobContext):
         "room": ctx.room.name,
     }
 
-    # Connect first so we can identify the caller.
     await ctx.connect()
 
-    # Wait for the first caller to join.
     participant = await ctx.wait_for_participant()
 
     user_id = participant.identity
+
+    call_id = ctx.room.name
+    call_started_at = datetime.now(timezone.utc).isoformat()
 
     logger.info(
         "Kural connected to caller: %s",
         user_id,
     )
 
-    # Set up the voice AI pipeline.
     session = AgentSession(
-
         stt=deepgram.STT(
             model="nova-3",
             language="ta",
         ),
-
         llm=google.LLM(
             model="gemini-3.5-flash-lite",
         ),
-
         tts=murf.TTS(
             voice="Anisha",
             style="Conversation",
@@ -509,29 +647,75 @@ async def my_agent(ctx: JobContext):
             ),
             text_pacing=True,
         ),
-
         turn_detection=MultilingualModel(),
-
         vad=ctx.proc.userdata["vad"],
-
         preemptive_generation=True,
     )
 
-    # Start the session.
-    await session.start(
-        agent=Assistant(user_id=user_id),
-        room=ctx.room,
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=lambda params: (
-                    noise_cancellation.BVCTelephony()
-                    if params.participant.kind
-                    == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-                    else noise_cancellation.BVC()
+    try:
+        await session.start(
+            agent=Assistant(user_id=user_id),
+            room=ctx.room,
+            room_options=room_io.RoomOptions(
+                audio_input=room_io.AudioInputOptions(
+                    noise_cancellation=lambda params: (
+                        noise_cancellation.BVCTelephony()
+                        if params.participant.kind
+                        == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+                        else noise_cancellation.BVC()
+                    ),
                 ),
             ),
-        ),
-    )
+        )
+
+        await session.wait_for_disconnect()
+
+        try:
+            record_call(
+                call_id=call_id,
+                user_id=user_id,
+                outcome="successful",
+                success_reason="Kural completed a health access conversation",
+                channel="browser",
+                started_at=call_started_at,
+                ended_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+            logger.info(
+                "Day 8 analytics: successful call recorded: %s",
+                call_id,
+            )
+
+        except Exception:
+            logger.exception(
+                "Analytics recording failed for call=%s",
+                call_id,
+            )
+
+    except Exception:
+        logger.exception(
+            "Kural session failed: %s",
+            call_id,
+        )
+
+        try:
+            record_call(
+                call_id=call_id,
+                user_id=user_id,
+                outcome="failed",
+                success_reason="Call ended unexpectedly",
+                channel="browser",
+                started_at=call_started_at,
+                ended_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to record analytics for call=%s",
+                call_id,
+            )
+
+        raise
 
 
 if __name__ == "__main__":
