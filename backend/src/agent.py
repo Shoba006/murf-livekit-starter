@@ -52,6 +52,10 @@ logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
 
+# ============================================================
+# MAIN KURAL PROMPT
+# ============================================================
+
 SYSTEM_PROMPT = """
 You are Kural, a friendly and responsible health access voice assistant.
 
@@ -70,6 +74,8 @@ OBJECTIVES
 4. Escalate serious or urgent situations appropriately.
 5. Help users find nearby healthcare facilities.
 6. Know when a human healthcare professional should take over.
+7. Hand off clinic and appointment-related requests to the Clinic and
+   Appointment Specialist.
 
 KNOWLEDGE
 
@@ -167,8 +173,6 @@ Use this tool when the caller asks to find a nearby:
 - primary health centre
 - similar healthcare facility
 
-The tool uses real OpenStreetMap data.
-
 If the caller asks for a nearby healthcare facility but has not provided
 a city, town, district, or locality, ask them for their location.
 
@@ -189,6 +193,48 @@ Do not guess a facility when the tool fails.
 
 If the tool returns no facilities, explain that no matching facilities
 were found within the search area.
+
+SPECIALIST HANDOFF
+
+Kural has a separate Clinic and Appointment Specialist.
+
+The specialist handles:
+
+- clinic selection
+- choosing between healthcare facility options
+- preparing for a clinic visit
+- appointment-related questions
+- what information the user may need before contacting a clinic
+- general appointment preparation
+
+If the caller clearly asks for clinic or appointment assistance,
+handoff to the Clinic and Appointment Specialist.
+
+Examples:
+
+"I want to book an appointment."
+
+"Which clinic should I visit?"
+
+"Help me choose a clinic."
+
+"I need to prepare for my doctor's appointment."
+
+"Can you help me with an appointment?"
+
+Before handing off, tell the caller clearly:
+
+"I'll connect you to our clinic and appointment specialist."
+
+Then use the transfer_to_clinic_specialist tool.
+
+Do NOT hand off ordinary health questions.
+
+Do NOT hand off emergency or red-flag situations to the specialist.
+Handle those using the escalation process.
+
+The specialist receives the existing conversation context, so do not ask
+the caller to repeat everything.
 
 HUMAN HELP / ESCALATION
 
@@ -234,7 +280,7 @@ private information.
 After create_escalation succeeds:
 
 - Give the caller the reference ID.
-- Tell the caller the request is open.
+- Tell them the request is open.
 - Explain that a human professional can review the request.
 - Do not promise an immediate response unless that is actually guaranteed.
 
@@ -243,25 +289,6 @@ If escalation creation fails:
 - Tell the caller that the request could not be created.
 - Do not invent a reference ID.
 - Still advise them to seek appropriate professional care.
-
-ESCALATION TOOL
-
-The create_escalation tool creates a real local human-help request.
-
-Use it ONLY after the caller has explicitly consented.
-
-The tool should contain only a short useful summary.
-
-The summary should include:
-
-- what happened
-- what the caller needs
-- what Kural already checked
-- urgency
-- language
-- preferred follow-up method
-
-Do not include unnecessary medical details.
 
 GUARDRAILS
 
@@ -277,21 +304,14 @@ Never pretend to be a doctor.
 
 If the user asks for a diagnosis, say:
 
-"I can't safely diagnose you. A qualified healthcare professional can assess your symptoms properly."
+"I can't safely diagnose you. A qualified healthcare professional can assess
+your symptoms properly."
 
 If the user describes potentially serious symptoms such as severe chest pain,
 difficulty breathing, loss of consciousness, severe bleeding, or sudden weakness,
 do not diagnose them.
 
 Advise them to seek urgent professional medical attention.
-
-ESCALATION
-
-When a situation is outside your scope, say:
-
-"I'm sorry, but I can't safely diagnose or prescribe treatment. A qualified
-medical professional can assess your symptoms properly. If your symptoms are
-severe or getting worse, please seek urgent medical care."
 
 OUT OF SCOPE
 
@@ -310,6 +330,131 @@ saved information naturally.
 """
 
 
+# ============================================================
+# CLINIC + APPOINTMENT SPECIALIST
+# ============================================================
+
+SPECIALIST_PROMPT = """
+You are Kural's Clinic and Appointment Specialist.
+
+You are a focused healthcare access specialist.
+
+YOUR JOB
+
+Help users with:
+
+- choosing a suitable clinic or healthcare facility
+- understanding which type of facility may be appropriate
+- preparing for a clinic visit
+- appointment-related questions
+- what information they may need when contacting a clinic
+- finding nearby healthcare facilities
+
+You are NOT a doctor.
+
+You do NOT diagnose medical conditions.
+
+You do NOT prescribe medication.
+
+You do NOT provide prescription dosages.
+
+You do NOT claim that a clinic has appointment availability unless
+real availability information is provided by a tool.
+
+LANGUAGE
+
+You support ONLY Tamil and English.
+
+If the user speaks English, respond in English.
+
+If the user speaks Tamil, respond in proper Tamil script.
+
+If the user speaks Tamil-English, respond naturally in Tamil-English.
+
+Never use Hindi, Telugu, Bengali, Malayalam, Kannada, Marathi,
+or any other language.
+
+Never romanize Tamil.
+
+STYLE
+
+Be warm, concise, and practical.
+
+Ask one question at a time.
+
+The user has already spoken with Kural.
+
+Do not ask the user to repeat the entire problem.
+
+Use the conversation history provided by Kural.
+
+HANDOFF CONTEXT
+
+Kural has transferred the conversation to you because the user needs
+clinic or appointment-related assistance.
+
+Briefly introduce yourself.
+
+For example:
+
+"Hi, I'm Kural's clinic and appointment specialist. I can help you
+with choosing a clinic or preparing for an appointment."
+
+Then continue directly with the user's request.
+
+HEALTHCARE FACILITY LOOKUP
+
+You can use the healthcare facility lookup tool.
+
+Use it when the user asks for nearby:
+
+- hospitals
+- clinics
+- PHCs
+- primary health centres
+- healthcare facilities
+
+If location is missing, ask for the city, town, district, or locality.
+
+Do not invent facilities.
+
+Do not claim that a facility is open or has appointment availability
+unless the tool explicitly provides that information.
+
+APPOINTMENTS
+
+You cannot actually book an appointment unless a real booking tool is
+provided.
+
+If the user asks to book an appointment, help them prepare by asking
+for relevant information such as:
+
+- preferred clinic
+- preferred date
+- preferred time
+- type of healthcare professional
+
+Do not claim that an appointment has been booked.
+
+If the user needs urgent medical attention, stop appointment planning
+and advise them to seek urgent professional care.
+
+OUT OF SCOPE
+
+If the user changes to a general health question, you may answer basic
+health access questions.
+
+If they need diagnosis or serious medical assessment, tell them that
+a qualified healthcare professional should assess them.
+
+Do not diagnose.
+"""
+
+
+# ============================================================
+# MAIN AGENT
+# ============================================================
+
 class Assistant(Agent):
 
     def __init__(self, user_id: str) -> None:
@@ -319,6 +464,10 @@ class Assistant(Agent):
 
         self.user_id = user_id
 
+    # --------------------------------------------------------
+    # MEMORY
+    # --------------------------------------------------------
+
     @function_tool
     async def lookup_user(
         self,
@@ -326,6 +475,8 @@ class Assistant(Agent):
     ) -> str:
         """
         Look up the current caller's saved memory.
+
+        Use this at the beginning of a conversation.
         """
 
         logger.info(
@@ -366,6 +517,8 @@ class Assistant(Agent):
     ) -> str:
         """
         Save caller information after explicit consent.
+
+        Consent must be true only after the caller clearly agrees.
         """
 
         if not consent:
@@ -438,6 +591,10 @@ class Assistant(Agent):
             ensure_ascii=False,
         )
 
+    # --------------------------------------------------------
+    # HEALTHCARE LOOKUP
+    # --------------------------------------------------------
+
     @function_tool
     async def find_healthcare_facility(
         self,
@@ -447,6 +604,8 @@ class Assistant(Agent):
     ) -> str:
         """
         Find nearby healthcare facilities using real OpenStreetMap data.
+
+        Use this for hospitals, clinics, PHCs and healthcare facilities.
         """
 
         logger.info(
@@ -485,6 +644,52 @@ class Assistant(Agent):
             result,
             ensure_ascii=False,
         )
+
+    # --------------------------------------------------------
+    # DAY 9 HANDOFF
+    # --------------------------------------------------------
+
+    @function_tool
+    async def transfer_to_clinic_specialist(
+        self,
+        context: RunContext,
+    ):
+        """
+        Transfer the caller to the Clinic and Appointment Specialist.
+
+        Use this ONLY when the caller needs focused help with:
+        - choosing a clinic
+        - clinic selection
+        - appointment questions
+        - preparing for an appointment
+        - finding a suitable healthcare facility
+
+        Do NOT use this for ordinary health questions.
+
+        Do NOT use this for emergency or red-flag symptoms.
+
+        The specialist receives the existing conversation context, so
+        the caller does not need to repeat their problem.
+        """
+
+        logger.info(
+            "Handing off caller %s to Clinic and Appointment Specialist",
+            self.user_id,
+        )
+
+        specialist = ClinicAppointmentSpecialist(
+            user_id=self.user_id,
+            chat_ctx=self.chat_ctx,
+        )
+
+        return (
+            specialist,
+            "I'm connecting you to our clinic and appointment specialist.",
+        )
+
+    # --------------------------------------------------------
+    # ESCALATION
+    # --------------------------------------------------------
 
     @function_tool
     async def create_escalation(
@@ -596,10 +801,110 @@ class Assistant(Agent):
         )
 
 
+# ============================================================
+# CLINIC + APPOINTMENT SPECIALIST
+# ============================================================
+
+class ClinicAppointmentSpecialist(Agent):
+
+    def __init__(
+        self,
+        user_id: str,
+        chat_ctx=None,
+    ) -> None:
+
+        super().__init__(
+            instructions=SPECIALIST_PROMPT,
+            chat_ctx=chat_ctx,
+        )
+
+        self.user_id = user_id
+
+    async def on_enter(self) -> None:
+        """
+        Introduce the specialist after the handoff.
+
+        The previous conversation is already available through chat_ctx.
+        """
+
+        logger.info(
+            "Clinic and Appointment Specialist took over for user_id=%s",
+            self.user_id,
+        )
+
+        await self.session.generate_reply(
+            instructions=(
+                "Introduce yourself briefly as Kural's clinic and "
+                "appointment specialist. Continue directly from the "
+                "caller's previous request. Do not ask them to repeat "
+                "their entire problem."
+            )
+        )
+
+    @function_tool
+    async def find_healthcare_facility(
+        self,
+        context: RunContext,
+        location: str,
+        facility_type: str = "any",
+    ) -> str:
+        """
+        Find nearby healthcare facilities using real OpenStreetMap data.
+
+        Use this when the caller needs help finding a clinic, hospital,
+        PHC or healthcare facility.
+        """
+
+        logger.info(
+            "Specialist healthcare lookup: location=%s, type=%s, user_id=%s",
+            location,
+            facility_type,
+            self.user_id,
+        )
+
+        try:
+            result = find_healthcare_facilities(
+                location=location,
+                facility_type=facility_type,
+                limit=3,
+            )
+
+        except Exception:
+            logger.exception(
+                "Specialist healthcare lookup failed for location=%s",
+                location,
+            )
+
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        "The healthcare facility lookup is temporarily "
+                        "unavailable."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        return json.dumps(
+            result,
+            ensure_ascii=False,
+        )
+
+
+# ============================================================
+# LIVEKIT SERVER
+# ============================================================
+
 server = AgentServer()
 
 
+# ============================================================
+# PREWARM
+# ============================================================
+
 def prewarm(proc: JobProcess):
+
     proc.userdata["vad"] = silero.VAD.load()
 
     initialize_database()
@@ -610,6 +915,10 @@ def prewarm(proc: JobProcess):
 server.setup_fnc = prewarm
 
 
+# ============================================================
+# LIVEKIT SESSION
+# ============================================================
+
 @server.rtc_session(agent_name="Kural")
 async def my_agent(ctx: JobContext):
 
@@ -617,8 +926,10 @@ async def my_agent(ctx: JobContext):
         "room": ctx.room.name,
     }
 
+    # Connect to LiveKit.
     await ctx.connect()
 
+    # Wait for caller.
     participant = await ctx.wait_for_participant()
 
     user_id = participant.identity
@@ -631,14 +942,24 @@ async def my_agent(ctx: JobContext):
         user_id,
     )
 
+    # --------------------------------------------------------
+    # SESSION
+    # --------------------------------------------------------
+
     session = AgentSession(
+
+        # Tamil speech recognition
         stt=deepgram.STT(
             model="nova-3",
             language="ta",
         ),
+
+        # Gemini
         llm=google.LLM(
             model="gemini-3.5-flash-lite",
         ),
+
+        # Murf Falcon / Anisha
         tts=murf.TTS(
             voice="Anisha",
             style="Conversation",
@@ -647,12 +968,20 @@ async def my_agent(ctx: JobContext):
             ),
             text_pacing=True,
         ),
+
         turn_detection=MultilingualModel(),
+
         vad=ctx.proc.userdata["vad"],
+
         preemptive_generation=True,
     )
 
     try:
+
+        # ----------------------------------------------------
+        # START SESSION
+        # ----------------------------------------------------
+
         await session.start(
             agent=Assistant(user_id=user_id),
             room=ctx.room,
@@ -668,37 +997,28 @@ async def my_agent(ctx: JobContext):
             ),
         )
 
-        await session.wait_for_disconnect()
+        logger.info(
+            "Kural session started successfully: %s",
+            call_id,
+        )
 
-        try:
-            record_call(
-                call_id=call_id,
-                user_id=user_id,
-                outcome="successful",
-                success_reason="Kural completed a health access conversation",
-                channel="browser",
-                started_at=call_started_at,
-                ended_at=datetime.now(timezone.utc).isoformat(),
-            )
-
-            logger.info(
-                "Day 8 analytics: successful call recorded: %s",
-                call_id,
-            )
-
-        except Exception:
-            logger.exception(
-                "Analytics recording failed for call=%s",
-                call_id,
-            )
+        # IMPORTANT:
+        # Do NOT call session.wait_for_disconnect().
+        #
+        # AgentSession in the installed LiveKit Agents version does not
+        # provide that method. The LiveKit session lifecycle is managed
+        # by the framework after session.start().
 
     except Exception:
+
         logger.exception(
             "Kural session failed: %s",
             call_id,
         )
 
+        # Analytics must never crash the voice agent.
         try:
+
             record_call(
                 call_id=call_id,
                 user_id=user_id,
@@ -710,6 +1030,7 @@ async def my_agent(ctx: JobContext):
             )
 
         except Exception:
+
             logger.exception(
                 "Failed to record analytics for call=%s",
                 call_id,
@@ -717,6 +1038,10 @@ async def my_agent(ctx: JobContext):
 
         raise
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
     cli.run_app(server)
